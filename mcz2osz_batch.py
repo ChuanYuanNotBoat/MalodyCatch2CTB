@@ -24,7 +24,10 @@ import os
 import sys
 import zipfile
 
-from mc2ctb_core import parse_mc_bytes, remove_stacked_notes, sanitize_filename
+from mc2ctb_core import (CIRCLE_SIZE, DEFAULT_JUDGE, MALODY_JUDGE_SCALES,
+                        circle_size_for_judge, parse_mc_bytes,
+                        remove_stacked_notes, sanitize_filename,
+                        validate_circle_size)
 
 AUDIO_EXT = (".ogg", ".mp3", ".wav")
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".bmp")
@@ -75,8 +78,9 @@ def resolve_conflicts(mapping):
     return final
 
 
-def convert_mcz(mcz_path, out_dir, dedupe=False):
+def convert_mcz(mcz_path, out_dir, dedupe=False, circle_size=CIRCLE_SIZE):
     """转换单个 mcz。返回 (converted, skipped, errors)。"""
+    circle_size = validate_circle_size(circle_size)
     converted, skipped, errors = 0, 0, []
     with zipfile.ZipFile(mcz_path) as zf:
         mc_entries = find_mc_entries(zf.namelist())
@@ -135,7 +139,7 @@ def convert_mcz(mcz_path, out_dir, dedupe=False):
                 errors.append("%s: 无法确定音频文件" % fname)
                 continue
             try:
-                text = chart.to_osu_text(audio)
+                text = chart.to_osu_text(audio, circle_size=circle_size)
             except Exception as e:
                 errors.append("%s: %s" % (fname, e))
                 continue
@@ -146,9 +150,10 @@ def convert_mcz(mcz_path, out_dir, dedupe=False):
                 fname.replace(".mc", ""))
             osu_texts.append((base + ".osu", text))
             converted += 1
-            print("  [转换] %s (%s) — fruit=%d banana=%d offset=%d AR=%s" % (
+            print("  [转换] %s (%s) — fruit=%d banana=%d offset=%d AR=%s CS=%.6g" % (
                 chart.version or fname, fname, chart.count_fruit,
-                chart.count_banana_shower, chart.offset, chart.speed - 0.5))
+                chart.count_banana_shower, chart.offset, chart.speed - 0.5,
+                circle_size))
 
         if not osu_texts:
             return 0, skipped, errors
@@ -191,6 +196,25 @@ def find_mcz_files(root, recursive):
     return sorted(files)
 
 
+def prompt_circle_size(pro=False):
+    """整批转换只询问一次；输入判定字母或直接输入目标 CS。"""
+    print(("Pro 判定换算：" if pro else "判定换算：") + " / ".join(
+        "%s=CS %.4f" % (judge, circle_size_for_judge(judge, pro))
+        for judge in MALODY_JUDGE_SCALES))
+    while True:
+        try:
+            choice = input("转谱判定 A/B/C/D/E，或自定义 CS (0–10) [默认 E]: ").strip()
+        except EOFError:
+            choice = ""
+        key = choice.upper() or DEFAULT_JUDGE
+        if key in MALODY_JUDGE_SCALES:
+            return circle_size_for_judge(key, pro)
+        try:
+            return validate_circle_size(choice)
+        except ValueError as error:
+            print("  %s；也可输入 A/B/C/D/E。" % error)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Malody Catch (mcz) → osu! ctb (osz) 批量转换")
@@ -204,7 +228,16 @@ def main():
                     help="不把已处理的 mcz 移入 input 文件夹")
     ap.add_argument("--dedupe", action="store_true",
                     help="剔除多压：同一时间且同一 x 的 Fruit 只保留第一个")
+    difficulty = ap.add_mutually_exclusive_group()
+    difficulty.add_argument("--judge", type=str.upper, choices=tuple(MALODY_JUDGE_SCALES),
+                            help="按 Malody A/B/C/D/E 判定换算 CS（默认 E）；指定后不询问")
+    difficulty.add_argument("--cs", type=validate_circle_size,
+                            help="直接指定目标 CS (0–10)，指定后不询问")
+    ap.add_argument("--pro", action="store_true",
+                    help="按 Pro 判定换算（接取宽度再乘 0.95，不能与 --cs 同用）")
     args = ap.parse_args()
+    if args.pro and args.cs is not None:
+        ap.error("--pro 用于判定换算，不能与 --cs 同用")
 
     cwd = os.getcwd()
     archive_dir = os.path.join(cwd, "input")
@@ -231,11 +264,22 @@ def main():
         print("未找到 .mcz 文件：%s" % in_root)
         return 1
 
+    if args.cs is not None:
+        circle_size = args.cs
+    elif args.judge is not None:
+        circle_size = circle_size_for_judge(args.judge, args.pro)
+    elif sys.stdin.isatty():
+        circle_size = prompt_circle_size(args.pro)
+    else:
+        circle_size = circle_size_for_judge(DEFAULT_JUDGE, args.pro)
+    print("本批输出 CS=%.12g" % circle_size)
+
     total_c = total_s = total_e = 0
     for path in mcz_files:
         print("处理: %s" % path)
         try:
-            c, s, errs = convert_mcz(path, out_dir, dedupe=args.dedupe)
+            c, s, errs = convert_mcz(path, out_dir, dedupe=args.dedupe,
+                                     circle_size=circle_size)
         except Exception as e:
             print("  [失败] %s" % e)
             total_e += 1

@@ -12,7 +12,7 @@
     因此首条红线 TimingPoint 的 time = −offset，所有物量时间同样减 offset，
     两侧锚系一致。
 转换规则（用户定稿）：
-    - CircleSize 为 3.8。
+    - CircleSize 按 Malody 判定的实际接取宽度换算，默认 E；也可直接指定 CS。
     - ApproachRate 为 meta.mode_ext.speed - 0.5；speed 缺省为 5（AR 4.5）。
     - Source 为 "Malody catch"。
     - 不剔除多押或重叠 note，按 1:1 保留。
@@ -21,9 +21,39 @@
 """
 
 import json
+import math
 import re
 
-CIRCLE_SIZE = 3.8
+MALODY_JUDGE_SCALES = {"A": 1.25, "B": 1.1, "C": 1.0, "D": 0.92, "E": 0.84}
+DEFAULT_JUDGE = "E"
+
+
+def validate_circle_size(value):
+    """osu! 标准 CS 范围；拒绝 NaN/Infinity，避免写出无效谱面。"""
+    try:
+        cs = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("CS 必须是 0 到 10 之间的有限数值") from None
+    if not math.isfinite(cs) or not 0 <= cs <= 10:
+        raise ValueError("CS 必须是 0 到 10 之间的有限数值")
+    return cs
+
+
+def circle_size_for_judge(judge=DEFAULT_JUDGE, pro=False):
+    """匹配横向接取宽度，不使用 Auto 余量或星级计算的缩盘修正。
+
+    Malody: W = 96 * JudgeScaler (512 场地)。
+    osu!: W = 106.75 * 0.8 * (1 - 0.14 * (CS - 5))。
+    Catch 不开启历史 1.00041 fudge；红果生成使用的宽度与接取宽度不同。
+    """
+    key = str(judge).strip().upper()
+    if key not in MALODY_JUDGE_SCALES:
+        raise ValueError("Malody 判定必须为 A、B、C、D 或 E")
+    width = 96.0 * MALODY_JUDGE_SCALES[key] * (0.95 if pro else 1.0)
+    return 5.0 + (1.0 - width / (106.75 * 0.8)) / 0.14
+
+
+CIRCLE_SIZE = circle_size_for_judge()
 DEFAULT_SPEED = 5          # mode_ext.speed 缺省值
 FILE_FORMAT_VERSION = 14   # osu file format v14
 SOURCE_TAG = "Malody catch"
@@ -187,10 +217,11 @@ class McChart:
                 version, SOURCE_TAG, tags)
         )
 
-    def to_osu_text(self, audio_filename):
+    def to_osu_text(self, audio_filename, circle_size=CIRCLE_SIZE):
         """生成 .osu 文件文本。audio_filename 必填。"""
         if not audio_filename:
             raise ValueError("无法确定音频文件名")
+        circle_size = validate_circle_size(circle_size)
         ar = self.speed - 0.5
         min_time = min((o["time"] for o in self.notes), default=0)
         audio_lead_in = max(0, int(-min_time + 500)) if min_time < 0 else 0
@@ -219,7 +250,7 @@ class McChart:
             "",
             "[Difficulty]",
             "HPDrainRate:5",
-            "CircleSize:%s" % CIRCLE_SIZE,
+            "CircleSize:%.12g" % circle_size,
             "OverallDifficulty:5",
             "ApproachRate:%s" % ar,
             "SliderMultiplier:1.8",
