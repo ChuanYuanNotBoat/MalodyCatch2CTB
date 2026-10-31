@@ -57,6 +57,7 @@ python .\mcz2osz_batch.py path\to\chart.mcz --cs 6.25
 - `mc2ctb_core.py`：时间线、谱面解析和 `.osu` 文本生成。
 - `mcz2osz_batch.py`：`.mcz` 扫描、资源处理和 `.osz` 打包。
 - `test_conversion.py`：判定换算、交互选择和整包转换回归；使用 `python -m unittest -v test_conversion` 运行。
+- `MalodyCatch2CTB-D/`：D 语言重写与 CCE Process Plugin 版本，详见目录内 README。
 
 ## 许可证
 
