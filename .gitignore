@@ -7,3 +7,4 @@ env/
 input/
 output/
 *.osz
+.vscode
