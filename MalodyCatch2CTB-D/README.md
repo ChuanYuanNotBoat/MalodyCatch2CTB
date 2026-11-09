@@ -6,7 +6,7 @@ Imported from the user-supplied `MalodyCatch2CTB-D-CCE-prototype.zip` on 2026-10
 Local integration fixes cover LDC const/reference compatibility and CCE working-copy
 export placement. Verified with LDC 1.43.0 / DUB 1.42.0 on Windows x64 using the
 converter tests and CCE's real plugin loader and asynchronous process adapter.
-The original ZIP remains unchanged. This source is distributed under the included MIT license.
+This source is distributed under the included MIT license. CCE pins this repository as a Git submodule.
 
 ## Scope
 
@@ -16,7 +16,7 @@ The original ZIP remains unchanged. This source is distributed under the include
 - Recreates basic metadata, BPM/red timing points, `meta.offset` or fallback sound-note offset, fruit/spinner-rain hit objects, whole-beat NewCombo, and default CS/AR.
 - Uses only D's standard library (`std.json`, `std.zip`) with no Python dependency.
 - CCE integration: one `runToolAction` button under **Tools / Plugin Tools**, with JSONL `stdin`/`stdout`; manifest API v2.
-- NEVER modifies the original chart or `.mcz`; writes a new file to a `ctb-output/` folder next to source and avoids filename overwrites. In CCE, `chart_path_source` selects the output location while `chart_path` supplies the current working-copy content.
+- Conversion leaves source files intact and avoids filename overwrites. Standalone conversion defaults to `ctb-output/` next to the source. CCE passes the folder chosen in the export dialog and can send multiple chart paths with separate field overrides for each difficulty.
 
 ## CCE repository build
 
@@ -32,7 +32,7 @@ cmake --build build --config Release --target CatchChartEditor CtbProcessPluginT
 ctest --test-dir build -C Release -R 'ctb_converter_smoke|CtbProcessPluginTests' --output-on-failure
 ```
 
-These commands run from the CCE repository root. Use
+Initialize the submodules and run these commands from the CCE repository root. Use
 `-DCATCHEDITOR_BUILD_CTB_PLUGIN=OFF` for a host-only build. Other desktop platforms
 can explicitly enable the option with a native LDC installation; they have not
 been verified here. The standalone commands below run from this source directory.
@@ -53,7 +53,7 @@ Or build and install directly:
 .\scripts\install.ps1 -CceExeDir 'C:\path\to\CatchChartEditor-release'
 ```
 
-`CceExeDir` must be the directory containing `CatchChartEditor.exe`. Restart CCE or reload plugins and find **导出 osu! Catch (.osz)** among plugin tools. Save a new chart before its first export. CCE synchronizes edits to its working copy before invoking the plugin. Output goes to `ctb-output/` beside the source chart (or beside the input if no source path is supplied); after a successful plugin export, Windows Explorer opens that folder and selects the new `.osz`. Success/failure is returned to the host and technical log messages go to stderr.
+`CceExeDir` must be the directory containing `CatchChartEditor.exe`. The export settings dialog requires CCE Beta v1.12.1 or later. Restart CCE or reload plugins and find **导出 osu! Catch (.osz)** among plugin tools. Save a new chart before its first export. The export dialog lets you override metadata and difficulty fields, set CS from the Malody A–E and Pro presets or enter a custom value, and choose the output folder. Export defaults to the current difficulty. Select all or choose individual difficulties and edit each one separately to package them in one .osz. CCE synchronizes edits to its working copy before invoking the plugin and can open the chosen folder after a successful export. The plugin reports its result to the host and logs to stderr.
 
 **Manual installation:** copy the executable, `LICENSE` and `plugin/malodycatch2ctb-d.plugin.json` side by side into `<CCE executable directory>/plugins/malodycatch2ctb-d/`. CCE recursively discovers manifests and resolves `./malodycatch2ctb-d.exe` relative to the manifest's folder.
 
@@ -77,7 +77,7 @@ Or build and install directly:
 6. Plugin actions use CCE's **15-second** timeout for `runToolAction`; huge packages may time out. For very large packages use CLI mode.
 7. One `.mcz` produces one `.osz`; `--dedupe` is a CLI-only option.
 8. Does not port the original Python CLI's directory-recursive scanning or automatic archive-to-`input` workflow (neither is appropriate to a one-click CCE plugin).
-9. Does not implement preview audio, conversion progress bars or GUI configuration.
+9. The standalone converter runs from the command line. The CCE integration provides the export settings dialog.
 
 ## Suggested verification before merging
 

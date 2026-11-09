@@ -149,24 +149,37 @@ class ConverterSmoke(unittest.TestCase):
                 hits = osu.split("[HitObjects]", 1)[1].strip().splitlines()
                 self.assertEqual(len(hits), expected)
 
-    def test_plugin_exports_working_copy_beside_source(self):
+    def test_plugin_exports_working_copy_and_overrides_to_chosen_directory(self):
         session = self.work / "session"
         saved = self.work / "saved"
+        output = self.work / "手选导出 #1"
         session.mkdir()
         saved.mkdir()
+        output.mkdir()
         src = session / "working.mc"
         src.write_text(json.dumps(chart(title="Current")), encoding="utf-8")
         original = saved / "original.mc"
         original.write_text(json.dumps(chart(title="Old")), encoding="utf-8")
         (session / "track.ogg").write_bytes(b"audio")
+        fields = {"Title": "New title", "TitleUnicode": "新曲名", "Artist": "New artist",
+                  "ArtistUnicode": "新曲师", "Creator": "New creator", "Version": "Expert",
+                  "Source": "New source", "Tags": "custom tags", "CircleSize": 5.7354,
+                  "HPDrainRate": 4.5, "OverallDifficulty": 6, "ApproachRate": 8,
+                  "SliderMultiplier": 2, "SliderTickRate": 2}
+        context = {"chart_path": str(src), "chart_path_source": str(original),
+                   "output_directory": str(output), "export_fields": fields}
         request = {"type": "request", "id": "export", "method": "runToolAction",
-                   "payload": {"action_id": "convert_current_catch_to_osz", "context": {
-                       "chart_path": str(src), "chart_path_source": str(original)}}}
+                   "payload": {"action_id": "convert_current_catch_to_osz", "context": context}}
         result = self.call("--plugin", input_data=json.dumps(request) + "\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["result"], result.stderr)
-        self.assertTrue((saved / "ctb-output" / "Current.osz").is_file())
+        with zipfile.ZipFile(output / "New title.osz") as z:
+            osu = z.read("New artist - New title (New creator) [Expert].osu").decode()
+            for key, value in fields.items():
+                self.assertIn(f"{key}:{value}", osu.splitlines())
+        self.assertFalse((saved / "ctb-output").exists())
         self.assertFalse((session / "ctb-output").exists())
+        self.assertEqual(json.loads(original.read_text(encoding="utf-8")), chart(title="Old"))
 
     def test_plugin_failure_recovers(self):
         requests = [
@@ -183,6 +196,53 @@ class ConverterSmoke(unittest.TestCase):
         self.assertFalse(responses[1]["result"])
         self.assertEqual(responses[2]["result"][0]["action_id"], "convert_current_catch_to_osz")
 
+    def test_plugin_selection_uses_each_difficulty_settings_and_resources(self):
+        selected = []
+        for index in range(3):
+            folder = self.work / f"难度 {index}"
+            folder.mkdir()
+            path = folder / "chart.mc"
+            fixture = chart(title="Shared title")
+            fixture["meta"]["version"] = f"Default {index}"
+            path.write_text(json.dumps(fixture), encoding="utf-8")
+            (folder / "track.ogg").write_bytes(f"audio-{index}".encode())
+            if index != 1:
+                selected.append({"chart_path": str(path), "export_fields": {
+                    "Version": f"Custom {index}", "CircleSize": 4 + index,
+                    "ApproachRate": 7 + index, "Creator": f"Mapper {index}"}})
+
+        def request(selection):
+            return {"type": "request", "id": "export", "method": "runToolAction",
+                    "payload": {"action_id": "convert_current_catch_to_osz", "context": {
+                        "output_directory": str(self.work), "export_difficulties": selection}}}
+
+        empty = self.call("--plugin", input_data=json.dumps(request([])) + "\n")
+        self.assertFalse(json.loads(empty.stdout)["result"], empty.stderr)
+        duplicate = self.call("--plugin", input_data=json.dumps(request(selected * 2)) + "\n")
+        self.assertFalse(json.loads(duplicate.stdout)["result"], duplicate.stderr)
+        missing_audio = self.work / "难度 2" / "track.ogg"
+        missing_audio.unlink()
+        invalid = self.call("--plugin", input_data=json.dumps(request(selected)) + "\n")
+        self.assertFalse(json.loads(invalid.stdout)["result"], invalid.stderr)
+        self.assertEqual(list(self.work.glob("*.osz")), [])
+        missing_audio.write_bytes(b"audio-2")
+
+        result = self.call("--plugin", input_data=json.dumps(request(selected)) + "\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["result"], result.stderr)
+        with zipfile.ZipFile(self.work / "Shared title.osz") as package:
+            maps = [name for name in package.namelist() if name.endswith(".osu")]
+            self.assertEqual(len(maps), 2)
+            for index in (0, 2):
+                name = next(name for name in maps if f"[Custom {index}]" in name)
+                osu = package.read(name).decode().splitlines()
+                self.assertIn(f"Creator:Mapper {index}", osu)
+                self.assertIn(f"CircleSize:{4 + index}", osu)
+                self.assertIn(f"ApproachRate:{7 + index}", osu)
+                audio = next(line.partition(":")[2].strip() for line in osu
+                             if line.startswith("AudioFilename:"))
+                self.assertEqual(package.read(audio), f"audio-{index}".encode())
+
     def test_reject_non_catch(self):
         src = self.work / "no.mc"
         c = chart()
@@ -198,7 +258,8 @@ class ConverterSmoke(unittest.TestCase):
             {"type": "notify", "event": "initialize", "payload": {"host_api_version": 3}},
             {"type": "request", "id": "a", "method": "listToolActions", "payload": {}},
             {"type": "request", "id": "b", "method": "runToolAction", "payload": {
-                "action_id": "convert_current_catch_to_osz", "context": {"chart_path": str(src)}
+                "action_id": "convert_current_catch_to_osz",
+                "context": {"chart_path": str(src), "output_directory": str(self.work)}
             }}
         ]
         result = self.call("--plugin", input_data="\n".join(json.dumps(x) for x in lines) + "\n")
@@ -207,6 +268,7 @@ class ConverterSmoke(unittest.TestCase):
         self.assertEqual(len(responses), 2)
         self.assertEqual(responses[0]["id"], "a")
         self.assertEqual(responses[0]["result"][0]["action_id"], "convert_current_catch_to_osz")
+        self.assertEqual(responses[0]["result"][0]["scope_selector"], "ctb_export")
         self.assertEqual(responses[1], {"type": "response", "id": "b", "result": True})
 
 

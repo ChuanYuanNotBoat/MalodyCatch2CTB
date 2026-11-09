@@ -13,10 +13,7 @@ import std.format : format;
 import std.json : JSONValue, JSONType, parseJSON, toJSON;
 import std.math : floor, fabs;
 import std.math.traits : isFinite;
-import std.path : baseName, dirName, extension, stripExtension, buildPath;
-version (Windows) {
-    import std.process : Config, spawnProcess;
-}
+import std.path : baseName, dirName, extension, stripExtension, buildPath, isAbsolute;
 import std.stdio : stdin, stdout, stderr, writeln;
 import std.string : strip, toLower, endsWith, startsWith, replace, split;
 import std.string : representation;
@@ -167,6 +164,8 @@ private Chart parseChart(string raw, string sourceName) {
     chart.creator = str(field(meta, "creator"));
     chart.versionName = str(field(meta, "version"));
     chart.background = str(field(meta, "background"));
+    const mainAudio = str(field(meta, "audio"));
+    if (mainAudio.length) chart.sounds ~= mainAudio;
     chart.speed = num(field(field(meta, "mode_ext"), "speed"), 5);
     if (chart.speed < -100 || chart.speed > 100) throw new Exception("Invalid speed");
     auto notes = arrayVal(field(root, "note"));
@@ -253,7 +252,47 @@ private int dedupe(ref Chart chart) {
     return removed;
 }
 
-private string osuText(const ref Chart chart, string audioFile, string backgroundFile) {
+private struct ExportMetadata {
+    string title, titleUnicode, artist, artistUnicode, creator, versionName, source, tags;
+}
+
+private string textOption(JSONValue fields, string key, string fallback) {
+    if (!hasField(fields, key)) return fallback;
+    auto value = field(fields, key);
+    if (value.type != JSONType.string || value.str.canFind('\r') ||
+        value.str.canFind('\n') || value.str.canFind('\0'))
+        throw new Exception("Invalid export field: " ~ key);
+    return value.str;
+}
+
+private ExportMetadata exportMetadata(const ref Chart chart, JSONValue fields) {
+    auto title = textOption(fields, "Title", chart.title.length ? chart.title : "unknown");
+    auto artist = textOption(fields, "Artist", chart.artist.length ? chart.artist : "unknown");
+    return ExportMetadata(
+        title, textOption(fields, "TitleUnicode", title),
+        artist, textOption(fields, "ArtistUnicode", artist),
+        textOption(fields, "Creator", chart.creator.length ? chart.creator : "unknown"),
+        textOption(fields, "Version", chart.versionName.length ? chart.versionName : "Catch"),
+        textOption(fields, "Source", "Malody catch"),
+        textOption(fields, "Tags", "malody catch " ~ chart.sourceName));
+}
+
+private string numberOption(JSONValue fields, string key, double fallback, double min, double max) {
+    double value = fallback;
+    if (hasField(fields, key)) {
+        auto option = field(fields, key);
+        if (option.type != JSONType.integer && option.type != JSONType.uinteger &&
+            option.type != JSONType.float_)
+            throw new Exception("Invalid export field: " ~ key);
+        value = num(option);
+        if (value < min || value > max)
+            throw new Exception("Export field out of range: " ~ key);
+    }
+    return key ~ ":" ~ format("%.12g", value);
+}
+
+private string osuText(const ref Chart chart, const ref ExportMetadata metadata,
+                       string audioFile, string backgroundFile, JSONValue fields) {
     if (!audioFile.length) throw new Exception("Cannot determine audio file");
     double earliest = 0;
     bool initialized = false;
@@ -269,18 +308,17 @@ private string osuText(const ref Chart chart, string audioFile, string backgroun
         "StackLeniency: 0.7", "Mode: 2", "LetterboxInBreaks: 0", "",
         "[Editor]", "DistanceSpacing: 1", "BeatDivisor: 4", "GridSize: 8", "",
         "[Metadata]",
-        "Title:" ~ (chart.title.length ? chart.title : "unknown"),
-        "TitleUnicode:" ~ (chart.title.length ? chart.title : "unknown"),
-        "Artist:" ~ (chart.artist.length ? chart.artist : "unknown"),
-        "ArtistUnicode:" ~ (chart.artist.length ? chart.artist : "unknown"),
-        "Creator:" ~ (chart.creator.length ? chart.creator : "unknown"),
-        "Version:" ~ (chart.versionName.length ? chart.versionName : "Catch"),
-        "Source:Malody catch",
-        "Tags:malody catch " ~ chart.sourceName,
+        "Title:" ~ metadata.title, "TitleUnicode:" ~ metadata.titleUnicode,
+        "Artist:" ~ metadata.artist, "ArtistUnicode:" ~ metadata.artistUnicode,
+        "Creator:" ~ metadata.creator, "Version:" ~ metadata.versionName,
+        "Source:" ~ metadata.source, "Tags:" ~ metadata.tags,
         "BeatmapID:0", "BeatmapSetID:-1", "", "[Difficulty]",
-        "HPDrainRate:5", "CircleSize:3.8", "OverallDifficulty:5",
-        "ApproachRate:" ~ format("%s", chart.speed - 0.5),
-        "SliderMultiplier:1.8", "SliderTickRate:1", "", "[Events]",
+        numberOption(fields, "HPDrainRate", 5, 0, 10),
+        numberOption(fields, "CircleSize", 3.8, 0, 10),
+        numberOption(fields, "OverallDifficulty", 5, 0, 10),
+        numberOption(fields, "ApproachRate", chart.speed - 0.5, 0, 10),
+        numberOption(fields, "SliderMultiplier", 1.8, 0.4, 3.6),
+        numberOption(fields, "SliderTickRate", 1, 0.5, 8), "", "[Events]",
         "//Background and Video events"
     ];
     if (backgroundFile.length) lines ~= "0,0," ~ backgroundFile ~ ",0,0";
@@ -308,9 +346,21 @@ private struct Resource {
     ubyte[] content;
 }
 
-private void nameResources(ref Resource[] resources) {
+private void nameResources(ref Resource[] resources, bool reuseIdentical) {
     bool[string] taken;
-    foreach (ref r; resources) {
+    size_t[][string] byName;
+    foreach (index, ref r; resources) {
+        auto key = toLower(r.original);
+        if (reuseIdentical) {
+            foreach (previous; byName.get(key, [])) {
+                if (resources[previous].content == r.content) {
+                    r.flat = resources[previous].flat;
+                    break;
+                }
+            }
+            if (r.flat.length) continue;
+            byName[key] ~= index;
+        }
         string initial = safeName(r.original, "file");
         string candidate = initial;
         auto ext = extension(initial);
@@ -322,19 +372,21 @@ private void nameResources(ref Resource[] resources) {
     }
 }
 
-private string matchResource(string refName, string songDir, Resource[] resources) {
+private string matchResource(string refName, string songDir, Resource[] resources, bool allowFallback) {
     if (!refName.length) return "";
     string leaf = baseName(normalized(refName));
     foreach (r; resources)
         if (r.directory == songDir && (r.original == leaf || r.internalName == normalized(refName))) return r.flat;
-    foreach (r; resources)
-        if (r.original == leaf) return r.flat;
+    if (allowFallback)
+        foreach (r; resources)
+            if (r.original == leaf) return r.flat;
     return "";
 }
 
-private string firstAudio(string songDir, Resource[] resources) {
+private string firstAudio(string songDir, Resource[] resources, bool allowFallback) {
     foreach (r; resources) if (r.directory == songDir && audio(r.flat)) return r.flat;
-    foreach (r; resources) if (audio(r.flat)) return r.flat;
+    if (allowFallback)
+        foreach (r; resources) if (audio(r.flat)) return r.flat;
     return "";
 }
 
@@ -359,34 +411,47 @@ private void addZipFile(ZipArchive z, string name, ubyte[] bytes) {
     z.addMember(member);
 }
 
-private string saveArchive(string src, string outDir, Chart[] charts, string[] chartDirs,
-                           Resource[] resources) {
-    nameResources(resources);
+private struct ExportDifficulty {
+    Chart chart;
+    string directory;
+    JSONValue fields;
+}
+
+private string saveArchive(string src, string outDir, ExportDifficulty[] difficulties,
+                           Resource[] resources, bool explicitSelection = false) {
+    nameResources(resources, explicitSelection);
     auto z = new ZipArchive();
     bool[string] written;
+    bool[string] usedResources;
     ulong overall = 0;
     int converted = 0;
-    foreach (i, chart; charts) {
-        string songDir = chartDirs[i];
+    foreach (ref difficulty; difficulties) {
+        auto chart = difficulty.chart;
+        auto songDir = difficulty.directory;
+        auto fields = difficulty.fields;
         string audioFile;
         foreach (sound; chart.sounds) {
-            audioFile = matchResource(sound, songDir, resources);
+            audioFile = matchResource(sound, songDir, resources, !explicitSelection);
             if (audioFile.length) break;
         }
-        if (!audioFile.length) audioFile = firstAudio(songDir, resources);
+        if (!audioFile.length) audioFile = firstAudio(songDir, resources, !explicitSelection);
         if (!audioFile.length) {
+            if (explicitSelection) throw new Exception("No audio for " ~ chart.sourceName);
             stderr.writeln("[W1401] No audio for ", chart.sourceName);
             continue;
         }
-        string bg = matchResource(chart.background, songDir, resources);
-        string name = safeName((chart.artist.length ? chart.artist : "unknown") ~ " - " ~
-            (chart.title.length ? chart.title : "unknown") ~ " (" ~
-            (chart.creator.length ? chart.creator : "unknown") ~ ") [" ~
-            (chart.versionName.length ? chart.versionName : chart.sourceName) ~ "]", chart.sourceName);
+        string bg = matchResource(chart.background, songDir, resources, !explicitSelection);
+        usedResources[audioFile] = true;
+        if (bg.length) usedResources[bg] = true;
+        auto metadata = exportMetadata(chart, fields);
+        string versionName = textOption(fields, "Version",
+            chart.versionName.length ? chart.versionName : chart.sourceName);
+        string name = safeName(metadata.artist ~ " - " ~ metadata.title ~ " (" ~
+            metadata.creator ~ ") [" ~ versionName ~ "]", chart.sourceName);
         string filename = name ~ ".osu";
         for (int n = 1; (toLower(filename) in written) !is null; ++n)
             filename = name ~ "_" ~ to!string(n) ~ ".osu";
-        string output = osuText(chart, audioFile, bg);
+        string output = osuText(chart, metadata, audioFile, bg, fields);
         auto bytes = output.dup.representation;
         overall += bytes.length;
         if (overall > MAX_TOTAL) throw new Exception("Output too large");
@@ -396,6 +461,7 @@ private string saveArchive(string src, string outDir, Chart[] charts, string[] c
     }
     if (!converted) throw new Exception("No Catch chart could be converted with audio");
     foreach (r; resources) {
+        if (explicitSelection && r.flat !in usedResources) continue;
         if ((toLower(r.flat) in written) !is null) continue;
         overall += r.content.length;
         if (overall > MAX_TOTAL) throw new Exception("Output too large");
@@ -403,13 +469,14 @@ private string saveArchive(string src, string outDir, Chart[] charts, string[] c
         written[toLower(r.flat)] = true;
     }
     mkdirRecurse(outDir);
-    string title = charts.length && charts[0].title.length ? charts[0].title : stripExtension(baseName(src));
+    auto title = textOption(difficulties[0].fields, "Title", difficulties[0].chart.title);
+    if (!title.length) title = stripExtension(baseName(src));
     string outputPath = uniqueOutput(buildPath(outDir, safeName(title, "beatmap") ~ ".osz"));
     write(outputPath, z.build());
     return outputPath;
 }
 
-private string convertZip(string src, string outputDir, bool mergeDuplicates) {
+private string convertZip(string src, string outputDir, bool mergeDuplicates, JSONValue fields) {
     auto zipped = read(src);
     if (zipped.length > MAX_TOTAL) throw new Exception("Input ZIP too large");
     auto z = new ZipArchive(zipped);
@@ -432,28 +499,27 @@ private string convertZip(string src, string outputDir, bool mergeDuplicates) {
         if (total > MAX_TOTAL) throw new Exception("Unpacked ZIP too large");
         return bytes.dup;
     }
-    Chart[] charts;
-    string[] chartDirs;
+    ExportDifficulty[] difficulties;
     foreach (name; chartNames) {
         try {
             auto chart = parseChart(cast(string) readMember(name), baseName(name));
             if (mergeDuplicates) dedupe(chart);
-            charts ~= chart;
-            chartDirs ~= normalized(dirName(normalized(name)));
+            difficulties ~= ExportDifficulty(chart, normalized(dirName(normalized(name))), fields);
         } catch (Exception e) {
             stderr.writeln("[W1402] Skip ", name, ": ", e.msg);
         }
     }
-    if (!charts.length) throw new Exception("No valid Catch chart");
+    if (!difficulties.length) throw new Exception("No valid Catch chart");
     Resource[] resources;
     foreach (name; names) {
         if (!media(name)) continue;
         string dir = normalized(dirName(normalized(name)));
         bool linked = false;
-        foreach (cd; chartDirs) if (cd == dir) { linked = true; break; }
+        foreach (d; difficulties) if (d.directory == dir) { linked = true; break; }
         if (!linked) {
             // Fallback by basename for externally referenced assets.
-            foreach (c; charts) {
+            foreach (d; difficulties) {
+                auto c = d.chart;
                 if (baseName(normalized(c.background)) == baseName(normalized(name)) && c.background.length)
                     linked = true;
                 foreach (sound; c.sounds)
@@ -463,31 +529,49 @@ private string convertZip(string src, string outputDir, bool mergeDuplicates) {
         if (!linked) continue;
         resources ~= Resource(name, baseName(normalized(name)), dir, "", readMember(name));
     }
-    return saveArchive(src, outputDir, charts, chartDirs, resources);
+    return saveArchive(src, outputDir, difficulties, resources);
 }
 
-private string convertMc(string src, string outDir, bool mergeDuplicates) {
-    auto bytes = read(src);
-    if (bytes.length > MAX_ENTRY) throw new Exception("Chart too large");
-    auto chart = parseChart(cast(string) bytes, baseName(src));
-    if (mergeDuplicates) dedupe(chart);
+private struct ChartRequest {
+    string path;
+    JSONValue fields;
+}
+
+private string convertMc(ChartRequest[] requests, string outDir, bool mergeDuplicates = false,
+                         bool explicitSelection = false) {
+    ExportDifficulty[] difficulties;
     Resource[] resources;
-    auto folder = dirName(src);
-    foreach (entry; dirEntries(folder, SpanMode.shallow)) {
-        if (!entry.isFile || !media(entry.name)) continue;
-        if (entry.size > MAX_ENTRY) continue;
-        auto name = baseName(entry.name);
-        resources ~= Resource(name, name, ".", "", cast(ubyte[]) read(entry.name));
+    bool[string] folders;
+    ulong total = 0;
+    foreach (request; requests) {
+        auto src = request.path;
+        auto bytes = read(src);
+        if (bytes.length > MAX_ENTRY || (explicitSelection && (total += bytes.length) > MAX_TOTAL))
+            throw new Exception("Chart input too large");
+        auto chart = parseChart(cast(string) bytes, baseName(src));
+        if (mergeDuplicates) dedupe(chart);
+        auto folder = dirName(src);
+        difficulties ~= ExportDifficulty(chart, folder, request.fields);
+        if (folder in folders) continue;
+        folders[folder] = true;
+        foreach (entry; dirEntries(folder, SpanMode.shallow)) {
+            if (!entry.isFile || !media(entry.name) || entry.size > MAX_ENTRY) continue;
+            if (explicitSelection && (resources.length >= MAX_ITEMS || (total += entry.size) > MAX_TOTAL))
+                throw new Exception("Media input too large");
+            auto name = baseName(entry.name);
+            resources ~= Resource(name, name, folder, "", cast(ubyte[]) read(entry.name));
+        }
     }
-    return saveArchive(src, outDir, [chart], ["."], resources);
+    return saveArchive(requests[0].path, outDir, difficulties, resources, explicitSelection);
 }
 
-private string convert(string input, string outputDir = "", bool mergeDuplicates = false) {
+private string convert(string input, string outputDir = "", bool mergeDuplicates = false,
+                       JSONValue fields = JSONValue.init) {
     if (!exists(input) || !isFile(input)) throw new Exception("Input not found: " ~ input);
     auto ext = toLower(extension(input));
     if (!outputDir.length) outputDir = buildPath(dirName(input), "ctb-output");
-    if (ext == ".mcz") return convertZip(input, outputDir, mergeDuplicates);
-    if (ext == ".mc") return convertMc(input, outputDir, mergeDuplicates);
+    if (ext == ".mcz") return convertZip(input, outputDir, mergeDuplicates, fields);
+    if (ext == ".mc") return convertMc([ChartRequest(input, fields)], outputDir, mergeDuplicates);
     throw new Exception("Expected .mc or .mcz");
 }
 
@@ -502,7 +586,8 @@ private JSONValue response(JSONValue id, JSONValue result) {
 private JSONValue actions() {
     return parseJSON(`[{"action_id":"convert_current_catch_to_osz",
         "title":"导出 osu! Catch (.osz)",
-        "description":"将当前已保存的 Catch 谱面转换为 .osz，输出在谱面旁的 ctb-output 目录；导出完成后会打开目录并选中生成的文件，不会修改原谱面。",
+        "description":"选择要导出的 Catch 难度，分别设置 osu! 谱面字段和判定，保存为一个 .osz。",
+        "scope_selector":"ctb_export",
         "placement":"tools_menu","requires_undo_snapshot":false}]`);
 }
 
@@ -514,15 +599,29 @@ private string chartPath(JSONValue ctx) {
     return "";
 }
 
-private void revealExportedFile(string path) {
-    version (Windows) {
-        try {
-            spawnProcess(["explorer.exe", "/select," ~ path], stdin, stdout, stderr,
-                         null, Config.detached);
-        } catch (Exception e) {
-            stderr.writeln("[W1002] Could not reveal exported file: ", e.msg);
-        }
+private JSONValue exportFields(JSONValue entry) {
+    auto fields = field(entry, "export_fields");
+    if (fields.type != JSONType.null_ && fields.type != JSONType.object)
+        throw new Exception("Invalid export fields");
+    return fields;
+}
+
+private string convertSelection(JSONValue selected, string outputDir) {
+    auto entries = arrayVal(selected);
+    if (!entries.length || entries.length > MAX_ITEMS)
+        throw new Exception("Invalid difficulty selection");
+    ChartRequest[] requests;
+    bool[string] paths;
+    foreach (entry; entries) {
+        auto path = str(field(entry, "chart_path"));
+        if (!isAbsolute(path) || toLower(extension(path)) != ".mc" || !isFile(path))
+            throw new Exception("Invalid selected chart: " ~ path);
+        if (path in paths)
+            throw new Exception("Duplicate selected chart: " ~ path);
+        paths[path] = true;
+        requests ~= ChartRequest(path, exportFields(entry));
     }
+    return convertMc(requests, outputDir, false, true);
 }
 
 private void pluginLoop() {
@@ -539,18 +638,18 @@ private void pluginLoop() {
             } else if (method == "runToolAction") {
                 if (str(field(payload, "action_id")) == "convert_current_catch_to_osz") {
                     auto ctx = field(payload, "context");
-                    auto path = chartPath(ctx);
-                    if (!path.length) throw new Exception("Save the chart before export");
-                    // CCE synchronizes the current document to a working copy.
-                    // Read that copy, but keep exports beside the user's source
-                    // so session cleanup cannot delete the converted archive.
-                    auto sourcePath = str(field(ctx, "chart_path_source"));
-                    string outputDir;
-                    if (sourcePath.length && exists(sourcePath))
-                        outputDir = buildPath(dirName(sourcePath), "ctb-output");
-                    string target = convert(path, outputDir);
+                    const outputDir = str(field(ctx, "output_directory"));
+                    if (!isAbsolute(outputDir) || !exists(outputDir) || !isDir(outputDir))
+                        throw new Exception("Choose an existing export directory");
+                    string target;
+                    if (hasField(ctx, "export_difficulties")) {
+                        target = convertSelection(field(ctx, "export_difficulties"), outputDir);
+                    } else {
+                        auto path = chartPath(ctx);
+                        if (!path.length) throw new Exception("Save the chart before export");
+                        target = convert(path, outputDir, false, exportFields(ctx));
+                    }
                     stderr.writeln("[I1001] Exported: ", target);
-                    revealExportedFile(target);
                     result = JSONValue(true);
                 }
             }
